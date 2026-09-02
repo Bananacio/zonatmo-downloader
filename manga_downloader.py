@@ -16,6 +16,7 @@ import shutil
 import asyncio
 import zipfile
 import argparse
+import math
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import requests
@@ -35,6 +36,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def chapter_number_to_dir_name(chapter_number: float) -> str:
+    """Convierte un número de capítulo en un nombre de carpeta seguro."""
+    cleaned = str(float(chapter_number)).replace('.', '_')
+    return f"cap_{cleaned}"
+
+
 # Dataclass para configuración
 @dataclass
 class MangaConfig:
@@ -49,6 +57,9 @@ class MangaConfig:
     max_retries: int = 3
     temp_dir: str = "temp"
     output_dir: str = "output"
+    selected_chapters: Optional[List[float]] = None
+    list_chapters: bool = False
+    debug: bool = False
 
 class ZonaTMODownloader:
     """Clase principal para descargar mangas de ZonaTMO"""
@@ -116,42 +127,44 @@ class ZonaTMODownloader:
         except Exception:
             logger.warning("La carga de capítulos no terminó en networkidle, continuando con la página disponible")
 
+        await page.evaluate(r"""
+            () => {
+                const toggle = Array.from(document.querySelectorAll('#chapters-hidden, .collapse, .chapter-toggle, .show-more, .btn'))
+                    .find((el) => {
+                        const text = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        return /ver todo|mostrar más|mostrar todos|ver más|expand|toggle|more/.test(text);
+                    });
+
+                if (toggle) {
+                    try {
+                        toggle.click();
+                    } catch (err) {
+                        // no-op
+                    }
+                }
+            }
+        """)
+        await page.wait_for_timeout(1500)
+
         chapters = await page.evaluate(r"""
             () => {
-                const anchors = [...document.querySelectorAll('a[href]')];
+                const items = [...document.querySelectorAll('li.upload-link[data-chapter-number]')];
                 const seen = new Set();
                 const chapters = [];
 
-                const normalizeText = (node) => (node ? node.textContent.replace(/\s+/g, ' ').trim() : '');
-                const isLikelyChapterLink = (href, text) => {
-                    if (!href) return false;
-                    const haystack = `${href} ${text}`.toLowerCase();
-                    const hasChapterMarker = /chapter|chapters|read|viewer|view_uploads|library/.test(haystack);
-                    const hasChapterNumber = /\d+/.test(haystack);
-                    const hasBadMarker = /cover|poster|banner|logo|avatar|icon|genre|author|tag|search|login|signup|download/.test(haystack);
-                    return hasChapterMarker && hasChapterNumber && !hasBadMarker;
-                };
+                for (const item of items) {
+                    const rawNumber = item.getAttribute('data-chapter-number');
+                    if (!rawNumber) continue;
 
-                for (const anchor of anchors) {
-                    const href = anchor.href || '';
-                    const rawText = normalizeText(anchor);
-                    const contextText = normalizeText(anchor.closest('li, tr, .list-group-item, .chapter-item, .chapter-row')) || rawText;
-
-                    if (!isLikelyChapterLink(href, contextText)) {
-                        continue;
-                    }
-
-                    let title = contextText || rawText || 'Capítulo';
-                    const candidate = title.match(/Capítulo\s+(\d+)/i) ||
-                                      title.match(/Chapter\s+(\d+)/i) ||
-                                      title.match(/#(\d+)/i) ||
-                                      href.match(/(?:chapter|chapters|capitulo|capítulo|read|viewer|view_uploads)[^\d]*(\d+)/i) ||
-                                      href.match(/(\d+)(?:\/)?$/);
-
-                    if (!candidate) continue;
-
-                    const chapterNumber = parseInt(candidate[1], 10);
+                    const chapterNumber = Number.parseFloat(rawNumber);
                     if (!Number.isFinite(chapterNumber) || chapterNumber <= 0) continue;
+
+                    const titleEl = item.querySelector('.chapter-number');
+                    const title = titleEl ? titleEl.textContent.replace(/\s+/g, ' ').trim() : `Capítulo ${chapterNumber}`;
+
+                    const readLink = item.querySelector('a[href*="/view_uploads/"]');
+                    const href = readLink ? readLink.href : '';
+                    if (!href) continue;
 
                     const key = `${chapterNumber}:${href}`;
                     if (seen.has(key)) continue;
@@ -159,7 +172,7 @@ class ZonaTMODownloader:
 
                     chapters.push({
                         number: chapterNumber,
-                        title: title || `Capítulo ${chapterNumber}`,
+                        title,
                         url: href,
                         index: chapters.length
                     });
@@ -179,35 +192,39 @@ class ZonaTMODownloader:
             await page.goto(chapter_url, wait_until='domcontentloaded', timeout=60000)
             await page.wait_for_timeout(1500)
 
-            candidate_urls = await page.evaluate(r"""
-                () => {
-                    const anchors = [...document.querySelectorAll('a[href]')];
-                    const scored = [];
+            candidate_urls = []
+            if '/view_uploads/' in chapter_url:
+                candidate_urls = [chapter_url]
+            else:
+                candidate_urls = await page.evaluate(r"""
+                    () => {
+                        const anchors = [...document.querySelectorAll('a[href]')];
+                        const scored = [];
 
-                    anchors.forEach((anchor) => {
-                        const href = anchor.href || '';
-                        const text = (anchor.textContent || '').trim().toLowerCase();
-                        if (!href || href.includes('javascript:')) return;
+                        anchors.forEach((anchor) => {
+                            const href = anchor.href || '';
+                            const text = (anchor.textContent || '').trim().toLowerCase();
+                            if (!href || href.includes('javascript:')) return;
 
-                        let score = 0;
-                        if (/\/viewer\//i.test(href)) score += 5;
-                        if (/\/read\//i.test(href)) score += 5;
-                        if (/\/chapter\//i.test(href)) score += 4;
-                        if (/view_uploads\//i.test(href)) score += 3;
-                        if (/leer|read|ver|capitulo|chapter/i.test(text)) score += 2;
-                        if (/cover|poster|banner|logo|avatar|icon|download|login|signup/i.test(href + ' ' + text)) score -= 10;
+                            let score = 0;
+                            if (/\/viewer\//i.test(href)) score += 5;
+                            if (/\/read\//i.test(href)) score += 5;
+                            if (/\/chapter\//i.test(href)) score += 4;
+                            if (/\/view_uploads\//i.test(href)) score += 6;
+                            if (/leer|read|ver|capitulo|chapter/i.test(text)) score += 2;
+                            if (/cover|poster|banner|logo|avatar|icon|download|login|signup/i.test(href + ' ' + text)) score -= 10;
 
-                        if (score > 0) {
-                            scored.push({ href, score });
-                        }
-                    });
+                            if (score > 0) {
+                                scored.push({ href, score });
+                            }
+                        });
 
-                    return scored
-                        .sort((a, b) => b.score - a.score)
-                        .slice(0, 10)
-                        .map(item => item.href);
-                }
-            """)
+                        return scored
+                            .sort((a, b) => b.score - a.score)
+                            .slice(0, 10)
+                            .map(item => item.href);
+                    }
+                """)
 
             if not candidate_urls:
                 return False
@@ -330,7 +347,7 @@ class ZonaTMODownloader:
             r'page[_-](\d+)',
             r'/(\d+)\.(?:jpg|png|webp)',
             r'image[_-](\d+)',
-            r'\d{3,}'
+            r'(\d{3,})'
         ]
         
         for pattern in patterns:
@@ -466,7 +483,7 @@ class ZonaTMODownloader:
 
         all_images = []
         for chapter in chapters:
-            chapter_dir = self.temp_dir / f"cap_{chapter['number']:03d}"
+            chapter_dir = self.temp_dir / chapter_number_to_dir_name(float(chapter['number']))
             if chapter_dir.exists():
                 images = sorted(chapter_dir.glob("pag_*"), key=lambda p: p.name)
                 all_images.extend(images)
@@ -491,7 +508,7 @@ class ZonaTMODownloader:
 
         all_images = []
         for chapter in chapters:
-            chapter_dir = self.temp_dir / f"cap_{chapter['number']:03d}"
+            chapter_dir = self.temp_dir / chapter_number_to_dir_name(float(chapter['number']))
             if chapter_dir.exists():
                 images = sorted(chapter_dir.glob("pag_*"), key=lambda p: p.name)
                 all_images.extend(images)
@@ -515,7 +532,7 @@ class ZonaTMODownloader:
     def clean_temp(self, chapters: List[Dict]):
         """Limpia los archivos temporales"""
         for chapter in chapters:
-            chapter_dir = self.temp_dir / f"cap_{chapter['number']:03d}"
+            chapter_dir = self.temp_dir / chapter_number_to_dir_name(float(chapter['number']))
             if chapter_dir.exists():
                 shutil.rmtree(chapter_dir)
                 logger.debug(f"Eliminado directorio temporal: {chapter_dir}")
@@ -528,6 +545,21 @@ class ZonaTMODownloader:
             
             # Obtener lista de capítulos
             chapters = await self.get_chapter_list()
+
+            if self.config.list_chapters:
+                logger.info("Capítulos disponibles:")
+                for chapter in chapters:
+                    logger.info(f" - {chapter['number']}: {chapter['title']}")
+                return
+
+            if self.config.selected_chapters:
+                selected_numbers = {float(chapter_number) for chapter_number in self.config.selected_chapters}
+                chapters = [chapter for chapter in chapters if float(chapter['number']) in selected_numbers]
+                logger.info(f"Capítulos filtrados por selección: {[chapter['number'] for chapter in chapters]}")
+
+                if not chapters:
+                    logger.error(f"No se encontraron capítulos para la selección: {sorted(selected_numbers)}")
+                    return
             
             if not chapters:
                 logger.error("No se encontraron capítulos")
@@ -551,8 +583,8 @@ class ZonaTMODownloader:
                 
                 # Descargar capítulos del volumen
                 for chapter in volume_chapters:
-                    chapter_dir = self.temp_dir / f"cap_{chapter['number']:03d}"
-                    
+                    chapter_dir = self.temp_dir / chapter_number_to_dir_name(float(chapter['number']))
+
                     success = await self.download_chapter(chapter, chapter_dir)
                     if not success:
                         logger.warning(f"Fallo la descarga del capítulo {chapter['number']}, continuando...")
@@ -598,7 +630,7 @@ class ZonaTMODownloader:
                 logger.error(f"No se encontró el capítulo {chapter_number}")
                 return
             
-            chapter_dir = self.temp_dir / f"cap_{chapter_number:03d}"
+            chapter_dir = self.temp_dir / chapter_number_to_dir_name(float(chapter_number))
             await self.download_chapter(target_chapter, chapter_dir)
             
             logger.info(f"Capítulo {chapter_number} descargado en: {chapter_dir}")
@@ -616,6 +648,10 @@ def parse_args():
     parser.add_argument("--name", default="Uma_Musume_Cinderella_Gray", help="Nombre base para el archivo de salida")
     parser.add_argument("--format", choices=["pdf", "cbz", "both"], default="pdf", help="Formato de salida")
     parser.add_argument("--headless", action="store_true", default=False, help="Ejecutar navegadores sin interfaz visual")
+    parser.add_argument("--debug", action="store_true", default=False, help="Activa logs detallados de diagnóstico")
+    parser.add_argument("--list-chapters", action="store_true", default=False, help="Muestra la lista de capítulos y sale sin descargar")
+    parser.add_argument("--chapter", type=float, action="append", default=[], help="Capítulo exacto a descargar. Se puede repetir el argumento")
+    parser.add_argument("--chapters", nargs="*", default=[], help="Capítulos o rangos a descargar. Ejemplos: 1 3-5 7.5")
     parser.add_argument("--volumes", nargs="*", default=[], help="Volúmenes en formato 1:1-7 2:8-16")
     parser.add_argument("--delay-captures", type=float, default=0.5)
     parser.add_argument("--delay-chapters", type=float, default=2.0)
@@ -638,18 +674,86 @@ def build_volume_map(raw_volumes: List[str]):
     return parsed
 
 
+def parse_chapter_targets(raw_targets: List[str]) -> List[float]:
+    """Parsea valores tipo '1', '3-5', '7.5' y devuelve una lista ordenada."""
+    if not raw_targets:
+        return []
+
+    values: List[float] = []
+
+    for item in raw_targets:
+        if not item:
+            continue
+
+        for chunk in str(item).split(','):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+
+            if '-' in chunk and not chunk.startswith('-'):
+                try:
+                    start_text, end_text = chunk.split('-', 1)
+                    start_value = float(start_text.strip())
+                    end_value = float(end_text.strip())
+                except ValueError:
+                    continue
+
+                start_number = min(start_value, end_value)
+                end_number = max(start_value, end_value)
+
+                if start_number.is_integer() and end_number.is_integer():
+                    numbers = range(int(math.ceil(start_number)), int(math.floor(end_number)) + 1)
+                    values.extend(float(number) for number in numbers)
+                else:
+                    values.append(start_value)
+                    values.append(end_value)
+                continue
+
+            try:
+                values.append(float(chunk))
+            except ValueError:
+                continue
+
+    seen = set()
+    ordered = []
+    for value in sorted(values):
+        rounded = round(float(value), 4)
+        if rounded not in seen:
+            seen.add(rounded)
+            ordered.append(rounded)
+
+    return ordered
+
+
 def main():
     """Función principal"""
     args = parse_args()
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+
+    selected_chapters = parse_chapter_targets(args.chapters)
+    if args.chapter:
+        selected_chapters.extend(float(value) for value in args.chapter)
+
+    if selected_chapters:
+        selected_chapters = sorted(set(round(float(value), 4) for value in selected_chapters))
+
+    volumes = build_volume_map(args.volumes)
+    if selected_chapters:
+        volumes = {1: (0, 999999)}
+
     config = MangaConfig(
         manga_url=args.url,
         manga_name=args.name,
-        volumes=build_volume_map(args.volumes),
+        volumes=volumes,
         output_format=args.format,
         headless=args.headless,
         delay_between_captures=args.delay_captures,
         delay_between_chapters=args.delay_chapters,
-        max_retries=args.max_retries
+        max_retries=args.max_retries,
+        selected_chapters=selected_chapters or None,
+        list_chapters=args.list_chapters,
+        debug=args.debug
     )
 
     downloader = ZonaTMODownloader(config)
