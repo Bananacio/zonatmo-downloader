@@ -1,0 +1,37 @@
+# Python virtual environment
+.venv/
+venv/
+venv*/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE/editor configs
+.vscode/
+.idea/
+.DS_Store
+
+# Project output
+output/
+temp/
+downloads/
+files/
+*.pdf
+*.cbz
+*.zip
+
+# Downloaded content
+*/downloads/
+*/output/
+
+# Environment files
+.env
+.env.*

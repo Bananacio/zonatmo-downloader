@@ -15,6 +15,7 @@ import time
 import shutil
 import asyncio
 import zipfile
+import argparse
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import requests
@@ -95,55 +96,79 @@ class ZonaTMODownloader:
     
     async def close_browser(self):
         """Cierra el navegador y limpia recursos"""
+        if self.context:
+            await self.context.close()
+            self.context = None
         if self.browser:
             await self.browser.close()
+            self.browser = None
             logger.info("Navegador cerrado")
     
     async def get_chapter_list(self) -> List[Dict]:
         """Obtiene la lista de capítulos del manga"""
         logger.info(f"Obteniendo lista de capítulos de: {self.config.manga_url}")
-        
+
         page = await self.context.new_page()
-        await page.goto(self.config.manga_url, wait_until='networkidle')
-        
-        # Esperar a que carguen los capítulos
-        await page.wait_for_selector('.list-group-item', timeout=10000)
-        
-        # Extraer información de los capítulos
-        chapters = await page.evaluate("""
+        await page.goto(self.config.manga_url, wait_until='domcontentloaded', timeout=60000)
+
+        try:
+            await page.wait_for_load_state('networkidle', timeout=20000)
+        except Exception:
+            logger.warning("La carga de capítulos no terminó en networkidle, continuando con la página disponible")
+
+        chapters = await page.evaluate(r"""
             () => {
-                const chapterElements = document.querySelectorAll('.list-group-item');
+                const anchors = [...document.querySelectorAll('a[href]')];
+                const seen = new Set();
                 const chapters = [];
-                
-                chapterElements.forEach((element, index) => {
-                    const link = element.querySelector('a');
-                    const titleElement = element.querySelector('.chapter-title, .title');
-                    
-                    if (link && titleElement) {
-                        const title = titleElement.textContent.trim();
-                        const url = link.href;
-                        
-                        // Extraer número de capítulo
-                        const chapterMatch = title.match(/Capítulo\s+(\d+)/i) || 
-                                           title.match(/Chapter\s+(\d+)/i) ||
-                                           title.match(/#(\d+)/);
-                        
-                        const chapterNumber = chapterMatch ? parseInt(chapterMatch[1]) : index + 1;
-                        
-                        chapters.push({
-                            number: chapterNumber,
-                            title: title,
-                            url: url,
-                            index: index
-                        });
+
+                const normalizeText = (node) => (node ? node.textContent.replace(/\s+/g, ' ').trim() : '');
+                const isLikelyChapterLink = (href, text) => {
+                    if (!href) return false;
+                    const haystack = `${href} ${text}`.toLowerCase();
+                    const hasChapterMarker = /chapter|chapters|read|viewer|view_uploads|library/.test(haystack);
+                    const hasChapterNumber = /\d+/.test(haystack);
+                    const hasBadMarker = /cover|poster|banner|logo|avatar|icon|genre|author|tag|search|login|signup|download/.test(haystack);
+                    return hasChapterMarker && hasChapterNumber && !hasBadMarker;
+                };
+
+                for (const anchor of anchors) {
+                    const href = anchor.href || '';
+                    const rawText = normalizeText(anchor);
+                    const contextText = normalizeText(anchor.closest('li, tr, .list-group-item, .chapter-item, .chapter-row')) || rawText;
+
+                    if (!isLikelyChapterLink(href, contextText)) {
+                        continue;
                     }
-                });
-                
-                // Ordenar por número de capítulo
+
+                    let title = contextText || rawText || 'Capítulo';
+                    const candidate = title.match(/Capítulo\s+(\d+)/i) ||
+                                      title.match(/Chapter\s+(\d+)/i) ||
+                                      title.match(/#(\d+)/i) ||
+                                      href.match(/(?:chapter|chapters|capitulo|capítulo|read|viewer|view_uploads)[^\d]*(\d+)/i) ||
+                                      href.match(/(\d+)(?:\/)?$/);
+
+                    if (!candidate) continue;
+
+                    const chapterNumber = parseInt(candidate[1], 10);
+                    if (!Number.isFinite(chapterNumber) || chapterNumber <= 0) continue;
+
+                    const key = `${chapterNumber}:${href}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+
+                    chapters.push({
+                        number: chapterNumber,
+                        title: title || `Capítulo ${chapterNumber}`,
+                        url: href,
+                        index: chapters.length
+                    });
+                }
+
                 return chapters.sort((a, b) => a.number - b.number);
             }
         """)
-        
+
         await page.close()
         logger.info(f"Se encontraron {len(chapters)} capítulos")
         return chapters
@@ -151,42 +176,69 @@ class ZonaTMODownloader:
     async def navigate_to_viewer(self, page: Page, chapter_url: str) -> bool:
         """Navega hasta el visor de imágenes del capítulo"""
         try:
-            # Navegar a la página del capítulo
-            await page.goto(chapter_url, wait_until='domcontentloaded')
-            
-            # Esperar y hacer clic en el botón de ver/leer
-            read_button = await page.wait_for_selector(
-                'a.btn-primary, .btn-ver, .btn-read, [href*="/viewer/"]',
-                timeout=10000
-            )
-            
-            if read_button:
-                viewer_url = await read_button.get_attribute('href')
-                if viewer_url:
-                    if not viewer_url.startswith('http'):
-                        base_url = chapter_url.split('/library/')[0]
-                        viewer_url = base_url + viewer_url
-                    
-                    await page.goto(viewer_url, wait_until='networkidle')
-                    
-                    # Esperar a que el visor cargue completamente
+            await page.goto(chapter_url, wait_until='domcontentloaded', timeout=60000)
+            await page.wait_for_timeout(1500)
+
+            candidate_urls = await page.evaluate(r"""
+                () => {
+                    const anchors = [...document.querySelectorAll('a[href]')];
+                    const scored = [];
+
+                    anchors.forEach((anchor) => {
+                        const href = anchor.href || '';
+                        const text = (anchor.textContent || '').trim().toLowerCase();
+                        if (!href || href.includes('javascript:')) return;
+
+                        let score = 0;
+                        if (/\/viewer\//i.test(href)) score += 5;
+                        if (/\/read\//i.test(href)) score += 5;
+                        if (/\/chapter\//i.test(href)) score += 4;
+                        if (/view_uploads\//i.test(href)) score += 3;
+                        if (/leer|read|ver|capitulo|chapter/i.test(text)) score += 2;
+                        if (/cover|poster|banner|logo|avatar|icon|download|login|signup/i.test(href + ' ' + text)) score -= 10;
+
+                        if (score > 0) {
+                            scored.push({ href, score });
+                        }
+                    });
+
+                    return scored
+                        .sort((a, b) => b.score - a.score)
+                        .slice(0, 10)
+                        .map(item => item.href);
+                }
+            """)
+
+            if not candidate_urls:
+                return False
+
+            for viewer_url in candidate_urls:
+                if not viewer_url.startswith('http'):
+                    base_url = chapter_url.split('/library/')[0]
+                    viewer_url = base_url + viewer_url
+
+                try:
+                    await page.goto(viewer_url, wait_until='domcontentloaded', timeout=60000)
                     await page.wait_for_timeout(2000)
-                    
-                    # Verificar si hay contenido del visor
-                    has_viewer = await page.evaluate("""
+
+                    has_images = await page.evaluate(r"""
                         () => {
-                            return document.querySelector('.viewer-container') !== null ||
+                            const imgCount = document.querySelectorAll('img').length;
+                            return imgCount > 0 ||
+                                   document.querySelector('.viewer-container') !== null ||
                                    document.querySelector('#viewer') !== null ||
                                    document.querySelector('.chapter-content') !== null ||
                                    document.querySelector('img[src*="data"]') !== null;
                         }
                     """)
-                    
-                    if has_viewer:
+
+                    if has_images:
                         return True
-            
+                except Exception:
+                    continue
+
             return False
-            
+
         except Exception as e:
             logger.error(f"Error navegando al visor: {e}")
             return False
@@ -194,89 +246,79 @@ class ZonaTMODownloader:
     async def extract_image_urls(self, page: Page) -> List[str]:
         """Extrae las URLs de las imágenes del capítulo"""
         try:
-            # Intentar diferentes selectores para encontrar imágenes
             selectors = [
                 '.viewer-container img',
                 '#viewer img',
                 '.chapter-content img',
                 '.reading-content img',
                 'img[data-src]',
-                'img[src*="http"]'
+                'img[src*="http"]',
+                'img'
             ]
-            
+
             image_urls = set()
-            
             for selector in selectors:
                 try:
                     await page.wait_for_selector(selector, timeout=5000)
-                    
-                    # Extraer URLs de imágenes
                     urls = await page.evaluate("""
                         (selector) => {
                             const images = document.querySelectorAll(selector);
-                            const urls = [];
-                            
+                            const urls = new Set();
+
                             images.forEach(img => {
-                                // Verificar data-src primero (lazy loading)
-                                const src = img.dataset.src || 
-                                          img.dataset.original ||
-                                          img.src;
-                                
-                                if (src && src.startsWith('http')) {
-                                    urls.push(src);
-                                }
+                                const src = img.dataset.src ||
+                                            img.dataset.original ||
+                                            img.dataset.lazy ||
+                                            img.src;
+
+                                if (!src || !src.startsWith('http')) return;
+                                if (/avatar|icon|logo|banner|thumbnail/i.test(src)) return;
+                                urls.add(src);
                             });
-                            
-                            return urls;
+
+                            return Array.from(urls);
                         }
                     """, selector)
-                    
+
                     if urls:
                         image_urls.update(urls)
                         break
-                        
                 except Exception:
                     continue
-            
-            # Si no encontramos imágenes con los selectores, intentar con scroll
+
             if not image_urls:
                 logger.warning("No se encontraron imágenes con selectores estándar, intentando con scroll...")
                 await self.scroll_page(page)
-                
-                # Reintentar extracción
-                image_urls = await page.evaluate("""
+                image_urls = await page.evaluate(r"""
                     () => {
                         const images = document.querySelectorAll('img');
                         const urls = new Set();
-                        
+
                         images.forEach(img => {
-                            const src = img.dataset.src || 
-                                      img.dataset.original ||
-                                      img.src;
-                            
-                            if (src && src.startsWith('http') && 
-                                !src.includes('avatar') && 
-                                !src.includes('icon')) {
+                            const src = img.dataset.src || img.dataset.original || img.dataset.lazy || img.src;
+                            if (!src || !src.startsWith('http')) return;
+                            if (/avatar|icon|logo|banner|thumbnail/i.test(src)) return;
+                            if (/\.((jpg|jpeg|png|webp|avif))(\?.*)?$/i.test(src) || /img|page|chapter|manga/i.test(src)) {
                                 urls.add(src);
                             }
                         });
-                        
+
                         return Array.from(urls);
                     }
                 """)
-            
-            # Filtrar URLs que no son imágenes del manga
+
             filtered_urls = []
             for url in image_urls:
-                if any(domain in url for domain in ['zona', 'tmo', 'manga', 'chapter', 'page']):
+                normalized = url.split('?')[0]
+                if re.search(r'\.(jpg|jpeg|png|webp|avif)', normalized, re.IGNORECASE):
                     filtered_urls.append(url)
-            
-            # Ordenar las URLs si es posible
+
+            filtered_urls = list(dict.fromkeys(filtered_urls))
             filtered_urls.sort(key=lambda x: self.extract_page_number(x))
-            
+
             logger.info(f"Se encontraron {len(filtered_urls)} imágenes")
             return filtered_urls
-            
+
         except Exception as e:
             logger.error(f"Error extrayendo URLs de imágenes: {e}")
             return []
@@ -326,23 +368,26 @@ class ZonaTMODownloader:
                 url,
                 headers=self.headers,
                 timeout=30,
-                stream=True
+                stream=True,
+                allow_redirects=True
             )
-            
-            if response.status_code == 200:
+
+            content_type = response.headers.get('Content-Type', '').lower()
+            if response.status_code == 200 and 'image' in content_type:
                 with open(save_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
                 return True
-            elif retry_count < self.config.max_retries:
-                logger.warning(f"Reintentando descarga ({retry_count + 1}/{self.config.max_retries}): {url}")
+
+            if retry_count < self.config.max_retries:
+                logger.warning(f"Reintentando descarga ({retry_count + 1}/{self.config.max_retries}): {url} (status={response.status_code}, content_type={content_type})")
                 await asyncio.sleep(1)
                 return await self.download_image(url, save_path, retry_count + 1)
-            else:
-                logger.error(f"Error descargando imagen: HTTP {response.status_code} - {url}")
-                return False
-                
+
+            logger.error(f"Error descargando imagen: HTTP {response.status_code} - {url}")
+            return False
+
         except Exception as e:
             if retry_count < self.config.max_retries:
                 logger.warning(f"Error descargando imagen, reintentando: {e}")
@@ -418,18 +463,16 @@ class ZonaTMODownloader:
         """Compila los capítulos en un archivo PDF"""
         output_file = self.output_dir / f"{self.config.manga_name}_Vol_{volume_number:02d}.pdf"
         logger.info(f"Generando PDF del volumen {volume_number}...")
-        
+
         all_images = []
         for chapter in chapters:
             chapter_dir = self.temp_dir / f"cap_{chapter['number']:03d}"
             if chapter_dir.exists():
-                # Obtener todas las imágenes del capítulo en orden
-                images = sorted(chapter_dir.glob("pag_*"))
+                images = sorted(chapter_dir.glob("pag_*"), key=lambda p: p.name)
                 all_images.extend(images)
-        
+
         if all_images:
             try:
-                # Convertir imágenes a PDF
                 with open(output_file, "wb") as f:
                     f.write(img2pdf.convert([str(img) for img in all_images]))
                 logger.info(f"PDF generado: {output_file}")
@@ -445,24 +488,21 @@ class ZonaTMODownloader:
         """Compila los capítulos en un archivo CBZ"""
         output_file = self.output_dir / f"{self.config.manga_name}_Vol_{volume_number:02d}.cbz"
         logger.info(f"Generando CBZ del volumen {volume_number}...")
-        
+
         all_images = []
         for chapter in chapters:
             chapter_dir = self.temp_dir / f"cap_{chapter['number']:03d}"
             if chapter_dir.exists():
-                # Obtener todas las imágenes del capítulo en orden
-                images = sorted(chapter_dir.glob("pag_*"))
+                images = sorted(chapter_dir.glob("pag_*"), key=lambda p: p.name)
                 all_images.extend(images)
-        
+
         if all_images:
             try:
-                # Crear archivo ZIP
                 with zipfile.ZipFile(output_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
                     for i, image_path in enumerate(all_images, 1):
-                        # Renombrar archivo para orden correcto en CBZ
                         arcname = f"page_{i:04d}{image_path.suffix}"
                         zipf.write(image_path, arcname)
-                
+
                 logger.info(f"CBZ generado: {output_file}")
                 return True
             except Exception as e:
@@ -569,29 +609,50 @@ class ZonaTMODownloader:
             await self.close_browser()
 
 
+def parse_args():
+    """Parsea argumentos de línea de comandos"""
+    parser = argparse.ArgumentParser(description="Descarga mangas de ZonaTMO y compúlalos en PDF/CBZ.")
+    parser.add_argument("--url", default="https://zonatmo.org/library/manga/19942/uma-musume-cinderella-gray", help="URL del manga")
+    parser.add_argument("--name", default="Uma_Musume_Cinderella_Gray", help="Nombre base para el archivo de salida")
+    parser.add_argument("--format", choices=["pdf", "cbz", "both"], default="pdf", help="Formato de salida")
+    parser.add_argument("--headless", action="store_true", default=False, help="Ejecutar navegadores sin interfaz visual")
+    parser.add_argument("--volumes", nargs="*", default=[], help="Volúmenes en formato 1:1-7 2:8-16")
+    parser.add_argument("--delay-captures", type=float, default=0.5)
+    parser.add_argument("--delay-chapters", type=float, default=2.0)
+    parser.add_argument("--max-retries", type=int, default=3)
+    return parser.parse_args()
+
+
+def build_volume_map(raw_volumes: List[str]):
+    """Construye el diccionario de volúmenes a partir de argumentos tipo '1:1-7'."""
+    if not raw_volumes:
+        return {1: (1, 7), 2: (8, 16), 3: (17, 25)}
+
+    parsed = {}
+    for item in raw_volumes:
+        if ':' not in item:
+            continue
+        volume, range_value = item.split(':', 1)
+        start, end = range_value.split('-', 1)
+        parsed[int(volume)] = (int(start), int(end))
+    return parsed
+
+
 def main():
     """Función principal"""
-    # Configuración del manga
+    args = parse_args()
     config = MangaConfig(
-        manga_url="https://zonatmo.org/library/manga/19942/uma-musume-cinderella-gray",
-        manga_name="Uma_Musume_Cinderella_Gray",
-        volumes={
-            1: (1, 7),
-            2: (8, 16),
-            3: (17, 25),
-            # Agregar más volúmenes según sea necesario
-        },
-        output_format="pdf",  # Cambiar a "cbz" o "both" según preferencia
-        headless=False,  # Cambiar a True para ejecutar sin interfaz gráfica
-        delay_between_captures=0.5,
-        delay_between_chapters=2.0,
-        max_retries=3
+        manga_url=args.url,
+        manga_name=args.name,
+        volumes=build_volume_map(args.volumes),
+        output_format=args.format,
+        headless=args.headless,
+        delay_between_captures=args.delay_captures,
+        delay_between_chapters=args.delay_chapters,
+        max_retries=args.max_retries
     )
-    
-    # Crear downloader y ejecutar
+
     downloader = ZonaTMODownloader(config)
-    
-    # Ejecutar la descarga
     asyncio.run(downloader.download_manga())
 
 
