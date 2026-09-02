@@ -14,6 +14,7 @@ al visor, descarga sus páginas y genera los archivos finales.
 - Permite definir volúmenes, capítulos y formatos desde la línea de comandos.
 - Permite listar capítulos sin descargar y activar logs de diagnóstico.
 - Reconoce capítulos decimales, por ejemplo `76.5`.
+- Permite controlar cuántas páginas se descargan simultáneamente.
 
 ## Requisitos
 
@@ -92,6 +93,20 @@ python manga_downloader.py \
   --name "Uma_Musume_Cinderella_Gray" \
   --format cbz \
   --chapters 76 76.5 77-79 \
+  --parallel-downloads 3 \
+  --headless
+```
+
+`--parallel-downloads` controla la cantidad máxima de páginas descargándose al
+mismo tiempo. El valor predeterminado es `1`, y conserva la descarga secuencial.
+Para acelerar sin exigir demasiado al servidor, se recomienda empezar con `3` o
+`4`:
+
+```bash
+python manga_downloader.py \
+  --volumes 9:76-85 \
+  --parallel-downloads 4 \
+  --delay-captures 0.1 \
   --headless
 ```
 
@@ -121,6 +136,11 @@ python manga_downloader.py \
 - `--delay-captures`: segundos entre descargas de páginas; por defecto `0.5`.
 - `--delay-chapters`: segundos entre capítulos; por defecto `2`.
 - `--max-retries`: intentos máximos por imagen; por defecto `3`.
+- `--parallel-downloads`: páginas simultáneas; por defecto `1`.
+
+Las descargas concurrentes tienen un límite para evitar saturar la conexión o
+activar medidas anti-bot. Si aparecen errores `Connection reset by peer`, bajar
+este valor a `2` o `3` y aumentar `--delay-captures`.
 
 ## Carpetas generadas
 

@@ -5,7 +5,7 @@ ZonaTMO Manga Downloader
 Script para descargar mangas de ZonaTMO y compilarlos en PDF/CBZ
 por volúmenes automáticamente.
 
-Autor: [Tu Nombre]
+Autor: [Ignacio Cano]
 Licencia: MIT
 """
 
@@ -60,6 +60,7 @@ class MangaConfig:
     selected_chapters: Optional[List[float]] = None
     list_chapters: bool = False
     debug: bool = False
+    parallel_downloads: int = 1
 
 class ZonaTMODownloader:
     """Clase principal para descargar mangas de ZonaTMO"""
@@ -274,6 +275,7 @@ class ZonaTMODownloader:
             ]
 
             image_urls = set()
+            matched_selector = None
             for selector in selectors:
                 try:
                     await page.wait_for_selector(selector, timeout=5000)
@@ -299,12 +301,14 @@ class ZonaTMODownloader:
 
                     if urls:
                         image_urls.update(urls)
+                        matched_selector = selector
                         break
                 except Exception:
                     continue
 
             if not image_urls:
                 logger.warning("No se encontraron imágenes con selectores estándar, intentando con scroll...")
+                matched_selector = 'img (después de scroll)'
                 await self.scroll_page(page)
                 image_urls = await page.evaluate(r"""
                     () => {
@@ -333,6 +337,13 @@ class ZonaTMODownloader:
             filtered_urls = list(dict.fromkeys(filtered_urls))
             filtered_urls.sort(key=lambda x: self.extract_page_number(x))
 
+            if matched_selector:
+                logger.debug(f"Selector de imágenes utilizado: {matched_selector}")
+            else:
+                logger.debug("No se identificó un selector específico para las imágenes")
+            if filtered_urls:
+                logger.debug(f"Primera URL de imagen: {filtered_urls[0]}")
+                logger.debug(f"Última URL de imagen: {filtered_urls[-1]}")
             logger.info(f"Se encontraron {len(filtered_urls)} imágenes")
             return filtered_urls
 
@@ -378,41 +389,57 @@ class ZonaTMODownloader:
             }
         """)
     
-    async def download_image(self, url: str, save_path: Path, retry_count: int = 0) -> bool:
-        """Descarga una imagen con reintentos"""
+    def _download_image_once(self, url: str, save_path: Path):
+        """Realiza una descarga síncrona; se ejecuta fuera del event loop."""
         try:
-            response = requests.get(
+            with requests.get(
                 url,
                 headers=self.headers,
                 timeout=30,
                 stream=True,
                 allow_redirects=True
-            )
+            ) as response:
+                content_type = response.headers.get('Content-Type', '').lower()
+                if response.status_code == 200 and 'image' in content_type:
+                    with open(save_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    return True, response.status_code, content_type
 
-            content_type = response.headers.get('Content-Type', '').lower()
-            if response.status_code == 200 and 'image' in content_type:
-                with open(save_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                return True
-
-            if retry_count < self.config.max_retries:
-                logger.warning(f"Reintentando descarga ({retry_count + 1}/{self.config.max_retries}): {url} (status={response.status_code}, content_type={content_type})")
-                await asyncio.sleep(1)
-                return await self.download_image(url, save_path, retry_count + 1)
-
-            logger.error(f"Error descargando imagen: HTTP {response.status_code} - {url}")
-            return False
-
+                return False, response.status_code, content_type
         except Exception as e:
-            if retry_count < self.config.max_retries:
-                logger.warning(f"Error descargando imagen, reintentando: {e}")
-                await asyncio.sleep(1)
-                return await self.download_image(url, save_path, retry_count + 1)
-            else:
-                logger.error(f"Error descargando imagen {url}: {e}")
-                return False
+            return False, None, str(e)
+
+    async def download_image(self, url: str, save_path: Path, retry_count: int = 0) -> bool:
+        """Descarga una imagen con reintentos sin bloquear otras descargas."""
+        success, status_code, detail = await asyncio.to_thread(
+            self._download_image_once,
+            url,
+            save_path
+        )
+
+        if success:
+            return True
+
+        if retry_count < self.config.max_retries:
+            logger.warning(f"Reintentando descarga ({retry_count + 1}/{self.config.max_retries}): {url} (status={status_code}, detalle={detail})")
+            await asyncio.sleep(1)
+            return await self.download_image(url, save_path, retry_count + 1)
+
+        if status_code is not None:
+            logger.error(f"Error descargando imagen: HTTP {status_code} - {url}")
+        else:
+            logger.error(f"Error descargando imagen {url}: {detail}")
+        return False
+
+    async def download_image_with_limit(self, semaphore: asyncio.Semaphore, url: str, save_path: Path, page_number: int, total_pages: int) -> bool:
+        """Descarga una imagen respetando el máximo de tareas simultáneas."""
+        async with semaphore:
+            success = await self.download_image(url, save_path)
+            if success:
+                logger.debug(f"Descargada imagen {page_number}/{total_pages}")
+            return success
     
     async def download_chapter(self, chapter: Dict, chapter_dir: Path) -> bool:
         """Descarga un capítulo completo"""
@@ -444,18 +471,22 @@ class ZonaTMODownloader:
                 return False
             
             # Descargar imágenes
-            successful_downloads = 0
+            download_tasks = []
+            semaphore = asyncio.Semaphore(self.config.parallel_downloads)
             for i, url in enumerate(image_urls, 1):
                 file_extension = Path(url.split('?')[0]).suffix or '.jpg'
                 image_path = chapter_dir / f"pag_{i:03d}{file_extension}"
-                
-                if await self.download_image(url, image_path):
-                    successful_downloads += 1
-                    logger.debug(f"Descargada imagen {i}/{len(image_urls)}")
-                
-                # Pequeño delay para evitar sobrecargar el servidor
-                if i < len(image_urls):
-                    await asyncio.sleep(self.config.delay_between_captures)
+                download_tasks.append(asyncio.create_task(
+                    self.download_image_with_limit(
+                        semaphore, url, image_path, i, len(image_urls)
+                    )
+                ))
+
+            results = await asyncio.gather(*download_tasks)
+            successful_downloads = sum(results)
+
+            if self.config.delay_between_captures > 0:
+                await asyncio.sleep(self.config.delay_between_captures)
             
             if successful_downloads > 0:
                 # Marcar capítulo como completo
@@ -656,6 +687,7 @@ def parse_args():
     parser.add_argument("--delay-captures", type=float, default=0.5)
     parser.add_argument("--delay-chapters", type=float, default=2.0)
     parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--parallel-downloads", type=int, default=1, help="Cantidad máxima de imágenes descargadas simultáneamente")
     return parser.parse_args()
 
 
@@ -751,6 +783,7 @@ def main():
         delay_between_captures=args.delay_captures,
         delay_between_chapters=args.delay_chapters,
         max_retries=args.max_retries,
+        parallel_downloads=max(1, args.parallel_downloads),
         selected_chapters=selected_chapters or None,
         list_chapters=args.list_chapters,
         debug=args.debug
