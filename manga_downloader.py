@@ -17,6 +17,7 @@ import asyncio
 import zipfile
 import argparse
 import math
+import sys
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import requests
@@ -61,6 +62,7 @@ class MangaConfig:
     list_chapters: bool = False
     debug: bool = False
     parallel_downloads: int = 1
+    show_progress: bool = True
 
 class ZonaTMODownloader:
     """Clase principal para descargar mangas de ZonaTMO"""
@@ -124,9 +126,9 @@ class ZonaTMODownloader:
         await page.goto(self.config.manga_url, wait_until='domcontentloaded', timeout=60000)
 
         try:
-            await page.wait_for_load_state('networkidle', timeout=20000)
+            await page.wait_for_selector('li.upload-link[data-chapter-number]', timeout=10000)
         except Exception:
-            logger.warning("La carga de capítulos no terminó en networkidle, continuando con la página disponible")
+            logger.warning("No apareció el listado de capítulos a tiempo, continuando con la página disponible")
 
         await page.evaluate(r"""
             () => {
@@ -145,7 +147,7 @@ class ZonaTMODownloader:
                 }
             }
         """)
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(300)
 
         chapters = await page.evaluate(r"""
             () => {
@@ -191,7 +193,6 @@ class ZonaTMODownloader:
         """Navega hasta el visor de imágenes del capítulo"""
         try:
             await page.goto(chapter_url, wait_until='domcontentloaded', timeout=60000)
-            await page.wait_for_timeout(1500)
 
             candidate_urls = []
             if '/view_uploads/' in chapter_url:
@@ -237,20 +238,13 @@ class ZonaTMODownloader:
 
                 try:
                     await page.goto(viewer_url, wait_until='domcontentloaded', timeout=60000)
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_selector(
+                        '.viewer-container img, #viewer img, .chapter-content img, '
+                        '.reading-content img, img[data-src], img[src*="http"], img',
+                        timeout=10000
+                    )
 
-                    has_images = await page.evaluate(r"""
-                        () => {
-                            const imgCount = document.querySelectorAll('img').length;
-                            return imgCount > 0 ||
-                                   document.querySelector('.viewer-container') !== null ||
-                                   document.querySelector('#viewer') !== null ||
-                                   document.querySelector('.chapter-content') !== null ||
-                                   document.querySelector('img[src*="data"]') !== null;
-                        }
-                    """)
-
-                    if has_images:
+                    if await page.locator('img').count() > 0:
                         return True
                 except Exception:
                     continue
@@ -265,12 +259,14 @@ class ZonaTMODownloader:
         """Extrae las URLs de las imágenes del capítulo"""
         try:
             selectors = [
+                'img[src*="http"]',
+                'img[data-src]',
+                'img[data-original]',
+                'img[data-lazy]',
                 '.viewer-container img',
                 '#viewer img',
                 '.chapter-content img',
                 '.reading-content img',
-                'img[data-src]',
-                'img[src*="http"]',
                 'img'
             ]
 
@@ -278,7 +274,7 @@ class ZonaTMODownloader:
             matched_selector = None
             for selector in selectors:
                 try:
-                    await page.wait_for_selector(selector, timeout=5000)
+                    await page.wait_for_selector(selector, timeout=1500)
                     urls = await page.evaluate("""
                         (selector) => {
                             const images = document.querySelectorAll(selector);
@@ -439,7 +435,29 @@ class ZonaTMODownloader:
             success = await self.download_image(url, save_path)
             if success:
                 logger.debug(f"Descargada imagen {page_number}/{total_pages}")
+            if self.config.delay_between_captures > 0:
+                await asyncio.sleep(self.config.delay_between_captures)
             return success
+
+    def render_progress(self, chapter_number: float, completed: int, total: int):
+        """Dibuja el progreso del capítulo en una única línea de la terminal."""
+        if not self.config.show_progress:
+            return
+
+        terminal_width = shutil.get_terminal_size((80, 20)).columns
+        bar_width = max(10, min(40, terminal_width - 38))
+        progress = completed / total if total else 1
+        filled = int(bar_width * progress)
+        bar = '#' * filled + '-' * (bar_width - filled)
+        message = f"Cap. {chapter_number:g} [{bar}] {completed}/{total}"
+        sys.stderr.write(f"\r{message[:terminal_width - 1]:<{terminal_width - 1}}")
+        sys.stderr.flush()
+
+    def finish_progress(self):
+        """Salta a la siguiente línea después de terminar una barra."""
+        if self.config.show_progress:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
     
     async def download_chapter(self, chapter: Dict, chapter_dir: Path) -> bool:
         """Descarga un capítulo completo"""
@@ -482,12 +500,16 @@ class ZonaTMODownloader:
                     )
                 ))
 
-            results = await asyncio.gather(*download_tasks)
-            successful_downloads = sum(results)
+            successful_downloads = 0
+            completed_downloads = 0
+            self.render_progress(chapter['number'], completed_downloads, len(image_urls))
+            for task in asyncio.as_completed(download_tasks):
+                if await task:
+                    successful_downloads += 1
+                completed_downloads += 1
+                self.render_progress(chapter['number'], completed_downloads, len(image_urls))
+            self.finish_progress()
 
-            if self.config.delay_between_captures > 0:
-                await asyncio.sleep(self.config.delay_between_captures)
-            
             if successful_downloads > 0:
                 # Marcar capítulo como completo
                 (chapter_dir / "complete.txt").write_text(
@@ -688,6 +710,7 @@ def parse_args():
     parser.add_argument("--delay-chapters", type=float, default=2.0)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--parallel-downloads", type=int, default=1, help="Cantidad máxima de imágenes descargadas simultáneamente")
+    parser.add_argument("--no-progress", action="store_true", help="Desactiva la barra de progreso")
     return parser.parse_args()
 
 
@@ -784,6 +807,7 @@ def main():
         delay_between_chapters=args.delay_chapters,
         max_retries=args.max_retries,
         parallel_downloads=max(1, args.parallel_downloads),
+        show_progress=not args.no_progress,
         selected_chapters=selected_chapters or None,
         list_chapters=args.list_chapters,
         debug=args.debug
