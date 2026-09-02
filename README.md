@@ -15,6 +15,7 @@ al visor, descarga sus páginas y genera los archivos finales.
 - Permite listar capítulos sin descargar y activar logs de diagnóstico.
 - Reconoce capítulos decimales, por ejemplo `76.5`.
 - Permite controlar cuántas páginas se descargan simultáneamente.
+- Muestra una barra de progreso en la terminal mientras descarga.
 
 ## Requisitos
 
@@ -97,6 +98,15 @@ python manga_downloader.py \
   --headless
 ```
 
+Durante la descarga se muestra el avance de cada capítulo:
+
+```text
+Cap. 76 [####################----------] 15/23
+```
+
+La barra se actualiza cuando termina cada página, incluso cuando hay varias
+descargas simultáneas. Para ocultarla, usar `--no-progress`.
+
 `--parallel-downloads` controla la cantidad máxima de páginas descargándose al
 mismo tiempo. El valor predeterminado es `1`, y conserva la descarga secuencial.
 Para acelerar sin exigir demasiado al servidor, se recomienda empezar con `3` o
@@ -137,6 +147,7 @@ python manga_downloader.py \
 - `--delay-chapters`: segundos entre capítulos; por defecto `2`.
 - `--max-retries`: intentos máximos por imagen; por defecto `3`.
 - `--parallel-downloads`: páginas simultáneas; por defecto `1`.
+- `--no-progress`: desactiva la barra de progreso, útil al guardar logs en un archivo.
 
 Las descargas concurrentes tienen un límite para evitar saturar la conexión o
 activar medidas anti-bot. Si aparecen errores `Connection reset by peer`, bajar

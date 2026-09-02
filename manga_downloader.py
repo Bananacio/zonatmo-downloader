@@ -17,6 +17,7 @@ import asyncio
 import zipfile
 import argparse
 import math
+import sys
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import requests
@@ -61,6 +62,7 @@ class MangaConfig:
     list_chapters: bool = False
     debug: bool = False
     parallel_downloads: int = 1
+    show_progress: bool = True
 
 class ZonaTMODownloader:
     """Clase principal para descargar mangas de ZonaTMO"""
@@ -440,6 +442,26 @@ class ZonaTMODownloader:
             if success:
                 logger.debug(f"Descargada imagen {page_number}/{total_pages}")
             return success
+
+    def render_progress(self, chapter_number: float, completed: int, total: int):
+        """Dibuja el progreso del capítulo en una única línea de la terminal."""
+        if not self.config.show_progress:
+            return
+
+        terminal_width = shutil.get_terminal_size((80, 20)).columns
+        bar_width = max(10, min(40, terminal_width - 38))
+        progress = completed / total if total else 1
+        filled = int(bar_width * progress)
+        bar = '#' * filled + '-' * (bar_width - filled)
+        message = f"Cap. {chapter_number:g} [{bar}] {completed}/{total}"
+        sys.stderr.write(f"\r{message[:terminal_width - 1]:<{terminal_width - 1}}")
+        sys.stderr.flush()
+
+    def finish_progress(self):
+        """Salta a la siguiente línea después de terminar una barra."""
+        if self.config.show_progress:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
     
     async def download_chapter(self, chapter: Dict, chapter_dir: Path) -> bool:
         """Descarga un capítulo completo"""
@@ -482,8 +504,15 @@ class ZonaTMODownloader:
                     )
                 ))
 
-            results = await asyncio.gather(*download_tasks)
-            successful_downloads = sum(results)
+            successful_downloads = 0
+            completed_downloads = 0
+            self.render_progress(chapter['number'], completed_downloads, len(image_urls))
+            for task in asyncio.as_completed(download_tasks):
+                if await task:
+                    successful_downloads += 1
+                completed_downloads += 1
+                self.render_progress(chapter['number'], completed_downloads, len(image_urls))
+            self.finish_progress()
 
             if self.config.delay_between_captures > 0:
                 await asyncio.sleep(self.config.delay_between_captures)
@@ -688,6 +717,7 @@ def parse_args():
     parser.add_argument("--delay-chapters", type=float, default=2.0)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--parallel-downloads", type=int, default=1, help="Cantidad máxima de imágenes descargadas simultáneamente")
+    parser.add_argument("--no-progress", action="store_true", help="Desactiva la barra de progreso")
     return parser.parse_args()
 
 
@@ -784,6 +814,7 @@ def main():
         delay_between_chapters=args.delay_chapters,
         max_retries=args.max_retries,
         parallel_downloads=max(1, args.parallel_downloads),
+        show_progress=not args.no_progress,
         selected_chapters=selected_chapters or None,
         list_chapters=args.list_chapters,
         debug=args.debug
